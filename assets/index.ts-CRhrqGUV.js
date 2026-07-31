@@ -64,6 +64,7 @@ let _flowAccountSwitchPaused=false;
 let _flowPauseOverlayEl=null;
 let _flowDraining=false;
 let _flowStashedPending=[];                 // prompts represados enquanto esvaziamos a fila
+let _flowQueueSnapshot=null;                // ultima fotografia valida da fila (ver _flowUpdateQueueSnapshot)
 
 function _flowSleep(ms){return new Promise(function(r){setTimeout(r,ms)})}
 
@@ -176,6 +177,16 @@ function _flowSerializeQueue(){
   }catch(e){return null;}
 }
 
+/* O worker interno remove o grupo de Z assim que pendingIndexes fica vazio
+   (ele considera o grupo concluido). Como o drain esvazia pendingIndexes de
+   proposito, a fila pode sumir de Z antes da troca - por isso guardamos uma
+   fotografia a cada checagem e usamos a ultima valida na hora de serializar. */
+function _flowUpdateQueueSnapshot(){
+  const snap=_flowSerializeQueue();
+  if(snap)_flowQueueSnapshot=snap;
+  return snap;
+}
+
 /* Motivo pelo qual ainda NAO podemos deslogar, ou null se a fila esta ociosa. */
 function _flowBusyReason(){
   /* 1. fila de download da extensao (videos/imagens ja gerados) */
@@ -240,7 +251,9 @@ async function _flowWaitForQueueDrain(){
         console.log("[FlowAutoSwitch] Credit warning disappeared, cancelling account switch.");
         return false;
       }
+      _flowUpdateQueueSnapshot();
       _flowStashPendingPrompts();
+      _flowUpdateQueueSnapshot();
 
       let reason=_flowBusyReason();
       if(!reason&&await _flowBrowserDownloadsBusy())reason="browser is still writing a download to disk";
@@ -274,7 +287,16 @@ async function _flowWaitForQueueDrain(){
 async function _flowInitiateCreditSwitch(){
   if(_flowAccountSwitchPaused)return;
   console.log("[FlowAutoSwitch] Credits exhausted detected! Initiating account switch...");
-  const serialized=_flowSerializeQueue();
+  const serialized=_flowUpdateQueueSnapshot()||_flowQueueSnapshot;
+  if(serialized){
+    try{
+      const groups=JSON.parse(serialized);
+      const total=groups.reduce(function(n,g){return n+(g.pendingIndexes||[]).length},0);
+      console.log("[FlowAutoSwitch] Carrying "+total+" pending prompt(s) in "+groups.length+" group(s) to the next account");
+    }catch(e){}
+  }else{
+    console.warn("[FlowAutoSwitch] No pending queue to carry over - nothing will be resumed after the switch");
+  }
   try{
     await chrome.runtime.sendMessage({
       type:"CREDITS_EXHAUSTED",
@@ -402,18 +424,30 @@ chrome.runtime.onMessage.addListener(function(msg,sender,sendResponse){
   return false;
 });
 
+/* O service worker marca justSwitched depois que a aba termina de carregar, e
+   pode ser encerrado no meio disso (service worker MV3 e efemero). Por isso
+   verificamos o storage repetidamente em vez de uma unica vez. */
+function _flowWatchForPostSwitchRestore(){
+  let tries=0;
+  const timer=setInterval(function(){
+    tries++;
+    if(_flowQueueRestored||tries>30){clearInterval(timer);return}
+    chrome.storage.local.get(FLOW_SWITCHER_KEY,function(data){
+      const st=data[FLOW_SWITCHER_KEY];
+      if(!st||!st.justSwitched||!st.pendingQueue)return;
+      clearInterval(timer);
+      console.log("[FlowAutoSwitch] Detected post-switch page load, restoring queue...");
+      chrome.storage.local.set({[FLOW_SWITCHER_KEY]:{...st,justSwitched:false}},function(){
+        _flowRestoreQueue(st.pendingQueue);
+      });
+    });
+  },2000);
+}
+
 if(window.location.href.includes("labs.google")){
   setTimeout(function(){
     _flowStartCreditMonitor();
-    chrome.storage.local.get(FLOW_SWITCHER_KEY,function(data){
-      const st=data[FLOW_SWITCHER_KEY];
-      if(st&&st.justSwitched&&st.pendingQueue){
-        console.log("[FlowAutoSwitch] Detected post-switch page load, restoring queue...");
-        chrome.storage.local.set({[FLOW_SWITCHER_KEY]:{...st,justSwitched:false}},function(){
-          _flowRestoreQueue(st.pendingQueue);
-        });
-      }
-    });
+    _flowWatchForPostSwitchRestore();
   },3000);
 }
 /* === END FLOW AUTO-SWITCH === */
