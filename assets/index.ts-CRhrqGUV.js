@@ -54,9 +54,18 @@
 
 /* === FLOW AUTO-SWITCH: Credit Exhaustion Detection & Account Switching === */
 const FLOW_SWITCHER_KEY="flowAccountSwitcher";
-let _flowCreditCheckInterval=null;
+/* Tempos do "drain" (esvaziamento da fila) antes de trocar de conta */
+const FLOW_DRAIN_POLL_MS=2000;              // intervalo entre checagens enquanto espera a fila
+const FLOW_DRAIN_STABLE_CHECKS=3;           // checagens ociosas seguidas exigidas antes de deslogar
+const FLOW_DRAIN_MAX_WAIT_MS=15*60*1e3;     // teto de espera para uma fila travada nao bloquear pra sempre
+
+let _flowCreditMonitorRunning=false;
 let _flowAccountSwitchPaused=false;
 let _flowPauseOverlayEl=null;
+let _flowDraining=false;
+let _flowStashedPending=[];                 // prompts represados enquanto esvaziamos a fila
+
+function _flowSleep(ms){return new Promise(function(r){setTimeout(r,ms)})}
 
 function _flowCheckCreditsExhausted(){
   try{
@@ -84,10 +93,66 @@ function _flowCheckCreditsExhausted(){
   ];
   return patterns.some(function(p){return p.test(body)});
 }
+
+/* Represa os prompts que ainda nao comecaram: sem creditos eles so falhariam e
+   ficariam em retry, impedindo a fila de esvaziar. Eles voltam para a fila
+   serializada e sao reenviados depois da troca de conta. */
+function _flowStashPendingPrompts(){
+  try{
+    if(typeof Z==="undefined"||!Array.isArray(Z))return;
+    for(let i=0;i<Z.length;i++){
+      const g=Z[i];
+      if(!g||!Array.isArray(g.pendingIndexes)||g.pendingIndexes.length===0)continue;
+      let entry=_flowStashedPending.find(function(s){return s.id===g.id});
+      if(!entry){entry={id:g.id,indexes:[]};_flowStashedPending.push(entry)}
+      for(const idx of g.pendingIndexes){
+        if(entry.indexes.indexOf(idx)===-1)entry.indexes.push(idx);
+      }
+      console.log("[FlowAutoSwitch] Holding "+g.pendingIndexes.length+" not-started prompt(s) of group "+g.id+" until the queue drains");
+      g.pendingIndexes.length=0;
+    }
+  }catch(e){}
+}
+
+/* Devolve os prompts represados caso a troca seja abortada (falso positivo,
+   creditos voltaram, usuario pausou). */
+function _flowRestoreStashedPrompts(){
+  try{
+    if(_flowStashedPending.length===0)return;
+    if(typeof Z!=="undefined"&&Array.isArray(Z)){
+      for(const entry of _flowStashedPending){
+        const g=Z.find(function(x){return x&&x.id===entry.id});
+        if(!g||!Array.isArray(g.pendingIndexes))continue;
+        for(const idx of entry.indexes){
+          if(g.pendingIndexes.indexOf(idx)===-1)g.pendingIndexes.push(idx);
+        }
+        g.pendingIndexes.sort(function(a,b){return a-b});
+      }
+    }
+    console.log("[FlowAutoSwitch] Account switch aborted, returned held prompts to the queue");
+    _flowStashedPending=[];
+  }catch(e){}
+}
+
+function _flowStashedIndexesFor(groupId){
+  const entry=_flowStashedPending.find(function(s){return s.id===groupId});
+  return entry?entry.indexes:[];
+}
+
 function _flowSerializeQueue(){
   try{
     if(typeof Z==="undefined"||!Array.isArray(Z)||Z.length===0)return null;
     const items=Z.map(function(group){
+      /* pendentes = represados + os que ainda estao na fila + o que estava em
+         andamento quando desistimos de esperar (senao esse prompt some) */
+      const pending=[];
+      const push=function(idx){
+        if(typeof idx==="number"&&idx>=0&&pending.indexOf(idx)===-1)pending.push(idx);
+      };
+      _flowStashedIndexesFor(group.id).forEach(push);
+      (group.pendingIndexes||[]).forEach(push);
+      push(group.currentPromptIndex);
+      pending.sort(function(a,b){return a-b});
       return{
         id:group.id,
         payloads:group.payloads.map(function(p){
@@ -101,7 +166,7 @@ function _flowSerializeQueue(){
         promptDelaySecondsMax:group.promptDelaySecondsMax,
         processedCount:group.processedCount,
         totalCount:group.totalCount,
-        pendingIndexes:[...group.pendingIndexes],
+        pendingIndexes:pending,
         completedPromptIndexes:[...group.completedPromptIndexes],
         retryCountByIndex:{...group.retryCountByIndex},
         downloadRetryCountByIndex:{...(group.downloadRetryCountByIndex||{})}
@@ -111,18 +176,30 @@ function _flowSerializeQueue(){
   }catch(e){return null;}
 }
 
-function _flowIsGenerating(){
+/* Motivo pelo qual ainda NAO podemos deslogar, ou null se a fila esta ociosa. */
+function _flowBusyReason(){
+  /* 1. fila de download da extensao (videos/imagens ja gerados) */
+  try{
+    if(typeof ee!=="undefined"&&Array.isArray(ee)&&ee.length>0){
+      return "download queue has "+ee.length+" item(s) left";
+    }
+  }catch(e){}
+
+  /* 2. prompt em geracao neste momento */
   try{
     if(typeof Z!=="undefined"&&Array.isArray(Z)){
       for(let i=0;i<Z.length;i++){
-        if(Z[i]){
-          if(Z[i].status==="running") return true;
-          if(Array.isArray(Z[i].payloads)){
-            for(let j=0;j<Z[i].payloads.length;j++){
-              const st=Z[i].payloads[j]?.status;
-              if(st==="running"||st==="submitted"||st==="retrying"||st==="generating"||st==="queued"||st==="downloading"){
-                return true;
-              }
+        const g=Z[i];
+        if(!g)continue;
+        if(g.status==="running"&&g.currentPromptIndex!==undefined&&g.currentPromptIndex!==null){
+          return "prompt #"+g.currentPromptIndex+" of group "+g.id+" is still generating";
+        }
+        /* 3. gerado com sucesso mas download ainda nao confirmado */
+        if(("running"===g.status||"queued"===g.status)&&Array.isArray(g.results)){
+          for(let r=0;r<g.results.length;r++){
+            const res=g.results[r];
+            if(res&&res.success&&!res.downloadComplete){
+              return "download of prompt #"+res.index+" has not finished";
             }
           }
         }
@@ -130,22 +207,68 @@ function _flowIsGenerating(){
     }
   }catch(e){}
 
+  /* 4. a propria pagina ainda mostra progresso de geracao */
   try{
-    if(typeof ee!=="undefined"&&Array.isArray(ee)&&ee.length>0){
-      for(let k=0;k<ee.length;k++){
-        if(ee[k]&&(ee[k].status==="running"||!ee[k].status||ee[k].status==="pending")){
+    const progressBars=document.querySelectorAll('mat-progress-bar, [role="progressbar"], .mat-mdc-progress-bar, mat-spinner, .mat-mdc-progress-spinner, [data-status="generating"]');
+    if(progressBars.length>0)return "page still shows generation progress";
+  }catch(e){}
+
+  return null;
+}
+
+function _flowIsGenerating(){return _flowBusyReason()!==null}
+
+/* 5. arquivo ainda sendo gravado em disco pelo chrome.downloads */
+async function _flowBrowserDownloadsBusy(){
+  try{
+    const resp=await chrome.runtime.sendMessage({type:"FLOW_DOWNLOADS_ACTIVE"});
+    return !!(resp&&resp.active);
+  }catch(e){return false;}
+}
+
+/* Espera tudo que ja esta em andamento terminar (gerar + baixar) antes de deslogar. */
+async function _flowWaitForQueueDrain(){
+  const startedAt=Date.now();
+  let idleStreak=0;
+  let lastReason=null;
+  _flowDraining=true;
+  console.log("[FlowAutoSwitch] Credits exhausted. Draining queue before switching account...");
+  try{
+    for(;;){
+      if(_flowAccountSwitchPaused)return false;
+      if(!_flowCheckCreditsExhausted()){
+        console.log("[FlowAutoSwitch] Credit warning disappeared, cancelling account switch.");
+        return false;
+      }
+      _flowStashPendingPrompts();
+
+      let reason=_flowBusyReason();
+      if(!reason&&await _flowBrowserDownloadsBusy())reason="browser is still writing a download to disk";
+
+      if(reason){
+        idleStreak=0;
+        if(reason!==lastReason){
+          console.log("[FlowAutoSwitch] Waiting before logout - "+reason);
+          lastReason=reason;
+        }
+      }else{
+        idleStreak++;
+        if(idleStreak>=FLOW_DRAIN_STABLE_CHECKS){
+          console.log("[FlowAutoSwitch] Queue drained (all files generated and downloaded). Switching account now.");
           return true;
         }
       }
+
+      if(Date.now()-startedAt>FLOW_DRAIN_MAX_WAIT_MS){
+        console.warn("[FlowAutoSwitch] Queue did not drain within "+Math.round(FLOW_DRAIN_MAX_WAIT_MS/6e4)+" min ("+(reason||"unknown")+"). Switching anyway; unfinished prompts are re-queued after the switch.");
+        return true;
+      }
+
+      await _flowSleep(FLOW_DRAIN_POLL_MS);
     }
-  }catch(e){}
-
-  try{
-    const progressBars = document.querySelectorAll('mat-progress-bar, [role="progressbar"], .mat-mdc-progress-bar, mat-spinner, .mat-mdc-progress-spinner, [data-status="generating"]');
-    if(progressBars.length > 0) return true;
-  }catch(e){}
-
-  return false;
+  }finally{
+    _flowDraining=false;
+  }
 }
 
 async function _flowInitiateCreditSwitch(){
@@ -163,30 +286,27 @@ async function _flowInitiateCreditSwitch(){
   }
 }
 
-let _flowIdleCycles = 0;
 function _flowStartCreditMonitor(){
-  if(_flowCreditCheckInterval)return;
-  _flowCreditCheckInterval=setInterval(function(){
-    if(_flowCheckCreditsExhausted()){
-      const progressBars = document.querySelectorAll('mat-progress-bar, [role="progressbar"], .mat-mdc-progress-bar, mat-spinner, .mat-mdc-progress-spinner, [data-status="generating"]');
-      if(progressBars.length > 0){
-        console.log("[FlowAutoSwitch] Credits exhausted, but generation/download still in progress. Waiting...");
-        _flowIdleCycles = 0;
-        return;
+  if(_flowCreditMonitorRunning)return;
+  _flowCreditMonitorRunning=true;
+  (async function(){
+    while(_flowCreditMonitorRunning){
+      await _flowSleep(3e3);
+      if(!_flowCreditMonitorRunning)return;
+      if(_flowAccountSwitchPaused)continue;
+      if(!_flowCheckCreditsExhausted())continue;
+
+      const drained=await _flowWaitForQueueDrain();
+      if(!drained){
+        _flowRestoreStashedPrompts();
+        continue;
       }
-      _flowIdleCycles++;
-      if(_flowIdleCycles < 2){
-         console.log("[FlowAutoSwitch] Generation finished, waiting 3s for download to trigger...");
-         return;
-      }
-      console.log("[FlowAutoSwitch] Credit exhaustion detected by monitor and no active generation.");
-      clearInterval(_flowCreditCheckInterval);
-      _flowCreditCheckInterval=null;
-      _flowInitiateCreditSwitch();
-    } else {
-      _flowIdleCycles = 0;
+      if(!_flowCreditMonitorRunning)return;
+      _flowCreditMonitorRunning=false;
+      await _flowInitiateCreditSwitch();
+      return;
     }
-  },3000);
+  })();
 }
 
 function _flowShowPauseOverlay(){
@@ -273,65 +393,98 @@ chrome.runtime.onMessage.addListener(function(msg,sender,sendResponse){
     sendResponse({success:true});
     return true;
   }
-  if(msg.type==="AUTO_FILL_FLOW"){
-    var payload={
-      payloads:msg.payloads,
-      groupId:msg.groupId,
-      concurrentPrompts:msg.concurrentPrompts,
-      promptDelaySecondsMin:msg.promptDelaySecondsMin,
-      promptDelaySecondsMax:msg.promptDelaySecondsMax
-    };
-    try{
-      chrome.storage.local.set({'flowLastRunPayload':payload});
-      console.log("[FlowAutoSwitch] Saved last run payload for auto-rerun");
-    }catch(e){}
-  }
   return false;
 });
 
 if(window.location.href.includes("labs.google")){
   setTimeout(function(){
     _flowStartCreditMonitor();
-    chrome.storage.local.get([FLOW_SWITCHER_KEY, 'flowAutoRunAfterLogin', 'flowLastRunPayload'],function(data){
+    chrome.storage.local.get(FLOW_SWITCHER_KEY,function(data){
       const st=data[FLOW_SWITCHER_KEY];
       if(st&&st.justSwitched&&st.pendingQueue){
         console.log("[FlowAutoSwitch] Detected post-switch page load, restoring queue...");
         chrome.storage.local.set({[FLOW_SWITCHER_KEY]:{...st,justSwitched:false}},function(){
           _flowRestoreQueue(st.pendingQueue);
         });
-      } else if(data['flowAutoRunAfterLogin']){
-        console.log("[FlowAutoSwitch] Detected post-login (autoAccountPicker), checking for saved run...");
-        chrome.storage.local.remove('flowAutoRunAfterLogin', function(){
-          const lastRun = data['flowLastRunPayload'];
-          if(lastRun && lastRun.payloads && lastRun.payloads.length > 0){
-            console.log("[FlowAutoSwitch] Re-executing last run with", lastRun.payloads.length, "payloads...");
-            setTimeout(function(){
-              try{
-                chrome.runtime.sendMessage({type:"SET_ZOOM",zoomFactor:0.8}).catch(function(){});
-              }catch(e){}
-              const fakeMessage={
-                type:"AUTO_FILL_FLOW",
-                payloads:lastRun.payloads,
-                groupId:"auto-rerun-"+Date.now()+"-"+Math.random().toString(36).slice(2,6),
-                concurrentPrompts:lastRun.concurrentPrompts||1,
-                promptDelaySecondsMin:lastRun.promptDelaySecondsMin||0,
-                promptDelaySecondsMax:lastRun.promptDelaySecondsMax||0
-              };
-              ce(fakeMessage,function(resp){
-                console.log("[FlowAutoSwitch] Auto-rerun response:",resp);
-              });
-            },5000);
-          } else {
-            // No saved payload - just open the side panel so user can click Run
-            console.log("[FlowAutoSwitch] No saved run found. Opening side panel...");
-            try{
-              chrome.runtime.sendMessage({type:"OPEN_SIDE_PANEL"}).catch(function(){});
-            }catch(e){}
-          }
-        });
       }
     });
   },3000);
 }
 /* === END FLOW AUTO-SWITCH === */
+
+/* === FLOW ERROR RECOVERY: clica "Voltar aos projetos" na pagina de erro === */
+const FLOW_ERROR_CHECK_MS=2000;             // intervalo de checagem da pagina de erro
+const FLOW_ERROR_CONFIRM_CHECKS=2;          // checagens seguidas antes de clicar (evita flash momentaneo)
+const FLOW_ERROR_CLICK_COOLDOWN_MS=8000;    // espera entre cliques, caso a pagina de erro continue
+let _flowErrorWatcherRunning=false;
+let _flowErrorStreak=0;
+let _flowLastErrorClickAt=0;
+
+function _flowNormalizeText(t){return (t||"").replace(/\s+/g," ").trim()}
+
+function _flowIsErrorPage(){
+  try{
+    const body=document.body?_flowNormalizeText(document.body.innerText):"";
+    if(!body)return false;
+    return /(algo deu errado|something went wrong|algo sali[oó] mal|une erreur s'est produite|qualcosa (è|e) andato storto)/i.test(body);
+  }catch(e){return false}
+}
+
+/* As classes sao geradas (sc-16c4830a-1 MlnLX...) e mudam a cada build,
+   entao procuramos pelo texto do botao. */
+function _flowFindBackToProjectsButton(){
+  try{
+    const rx=/^(voltar aos projetos|back to projects|volver a los proyectos|retour aux projets|torna ai progetti)$/i;
+    const nodes=document.querySelectorAll('button, [role="button"], a');
+    for(let i=0;i<nodes.length;i++){
+      const el=nodes[i];
+      if(!el)continue;
+      if(!el.offsetWidth&&!el.offsetHeight)continue;   // invisivel
+      const txt=_flowNormalizeText(el.innerText||el.textContent);
+      if(!txt||txt.length>60)continue;
+      /* o icone material "arrow_back" entra no textContent, removemos antes de comparar */
+      const clean=txt.replace(/arrow_back/gi,"").replace(/\s+/g," ").trim();
+      if(rx.test(clean))return el;
+    }
+  }catch(e){}
+  return null;
+}
+
+function _flowClickElement(el){
+  try{
+    const opts={view:window,bubbles:true,cancelable:true,buttons:1};
+    el.dispatchEvent(new MouseEvent("mousedown",opts));
+    el.dispatchEvent(new MouseEvent("mouseup",{...opts,buttons:0}));
+    el.dispatchEvent(new MouseEvent("click",{...opts,buttons:0}));
+  }catch(e){}
+  try{if(typeof el.click==="function")el.click()}catch(e){}
+}
+
+function _flowStartErrorPageWatcher(){
+  if(_flowErrorWatcherRunning)return;
+  _flowErrorWatcherRunning=true;
+  setInterval(function(){
+    try{
+      if(_flowAccountSwitchPaused)return;            // overlay de "todas as contas sem creditos"
+      if(!_flowIsErrorPage()){_flowErrorStreak=0;return}
+      _flowErrorStreak++;
+      if(_flowErrorStreak<FLOW_ERROR_CONFIRM_CHECKS)return;
+      if(Date.now()-_flowLastErrorClickAt<FLOW_ERROR_CLICK_COOLDOWN_MS)return;
+      const btn=_flowFindBackToProjectsButton();
+      if(!btn){
+        console.log("[FlowErrorRecovery] Error page detected, but the 'Voltar aos projetos' button is not on screen yet");
+        return;
+      }
+      _flowLastErrorClickAt=Date.now();
+      _flowErrorStreak=0;
+      console.log("[FlowErrorRecovery] Error page detected - clicking 'Voltar aos projetos'");
+      _flowClickElement(btn);
+    }catch(e){}
+  },FLOW_ERROR_CHECK_MS);
+}
+
+if(window.location.href.includes("labs.google")){
+  _flowStartErrorPageWatcher();
+}
+/* === END FLOW ERROR RECOVERY === */
 })()
