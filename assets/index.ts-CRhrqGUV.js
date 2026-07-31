@@ -337,9 +337,15 @@ function _flowShowPauseOverlay(){
   }
 }
 
+let _flowQueueRestored=false;
 function _flowRestoreQueue(serializedQueue){
   try{
     if(!serializedQueue)return;
+    if(_flowQueueRestored){
+      console.log("[FlowAutoSwitch] Queue already restored on this page load, ignoring duplicate signal");
+      return;
+    }
+    _flowQueueRestored=true;
     const items=JSON.parse(serializedQueue);
     if(!Array.isArray(items)||items.length===0)return;
     console.log("[FlowAutoSwitch] Restoring "+items.length+" queue group(s) from previous session...");
