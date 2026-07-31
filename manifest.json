@@ -13,6 +13,16 @@
       {
          "all_frames": false,
          "js": [
+            "assets/index.ts-CRhrqGUV.js"
+         ],
+         "matches": [
+            "*://labs.google/*"
+         ],
+         "run_at": "document_end"
+      },
+      {
+         "all_frames": false,
+         "js": [
             "assets/autoCreateFlow.js"
          ],
          "matches": [
