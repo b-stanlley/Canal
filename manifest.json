@@ -9,19 +9,33 @@
       "service_worker": "service-worker-loader.js",
       "type": "module"
    },
-   "content_scripts": [ {
-      "all_frames": false,
-      "js": [ "assets/index.ts-CRhrqGUV.js" ],
-      "matches": [ "*://labs.google/*" ],
-      "run_at": "document_end"
-   }, {
-      "all_frames": false,
-      "js": [ "assets/accountSwitcher.js" ],
-      "matches": [ "*://accounts.google.com/*" ],
-      "run_at": "document_end"
-   } ],
+   "content_scripts": [
+      {
+         "all_frames": false,
+         "js": [
+            "assets/autoCreateFlow.js"
+         ],
+         "matches": [
+            "*://labs.google/*"
+         ],
+         "run_at": "document_end"
+      },
+      {
+         "all_frames": false,
+         "js": [
+            "assets/accountSwitcher.js"
+         ],
+         "matches": [
+            "*://accounts.google.com/*"
+         ],
+         "run_at": "document_end"
+      }
+   ],
    "description": "Auto Flow your prompts at scale. Batch generate and auto-download videos and images on Google Flow.",
-   "host_permissions": [ "*://labs.google/*", "*://accounts.google.com/*" ],
+   "host_permissions": [
+      "*://labs.google/*",
+      "*://accounts.google.com/*"
+   ],
    "icons": {
       "128": "src/assets/logo.png",
       "16": "src/assets/logo.png",
@@ -32,16 +46,34 @@
    "manifest_version": 3,
    "name": "Flow Automation - Auto Flow on Google Flow",
    "offline_enabled": true,
-   "permissions": [ "storage", "tabs", "background", "sidePanel", "activeTab", "downloads", "debugger", "cookies" ],
+   "permissions": [
+      "storage",
+      "tabs",
+      "background",
+      "sidePanel",
+      "activeTab",
+      "downloads",
+      "debugger",
+      "cookies"
+   ],
    "side_panel": {
       "default_path": "src/ui/side-panel/index.html"
    },
    "update_url": "https://clients2.google.com/service/update2/crx",
    "version": "3.2.3.0",
    "version_name": "3.2.3",
-   "web_accessible_resources": [ {
-      "matches": [ "*://labs.google/*" ],
-      "resources": [ "assets/catchUploadFile.ts-DJwIizxX.js", "assets/index.ts-CRhrqGUV.js", "assets/accountSwitcher.js" ],
-      "use_dynamic_url": false
-   } ]
+   "web_accessible_resources": [
+      {
+         "matches": [
+            "*://labs.google/*"
+         ],
+         "resources": [
+            "assets/catchUploadFile.ts-DJwIizxX.js",
+            "assets/index.ts-CRhrqGUV.js",
+            "assets/accountSwitcher.js",
+            "assets/autoCreateFlow.js"
+         ],
+         "use_dynamic_url": false
+      }
+   ]
 }
