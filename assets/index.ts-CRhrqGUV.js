@@ -273,18 +273,61 @@ chrome.runtime.onMessage.addListener(function(msg,sender,sendResponse){
     sendResponse({success:true});
     return true;
   }
+  if(msg.type==="AUTO_FILL_FLOW"){
+    var payload={
+      payloads:msg.payloads,
+      groupId:msg.groupId,
+      concurrentPrompts:msg.concurrentPrompts,
+      promptDelaySecondsMin:msg.promptDelaySecondsMin,
+      promptDelaySecondsMax:msg.promptDelaySecondsMax
+    };
+    try{
+      chrome.storage.local.set({'flowLastRunPayload':payload});
+      console.log("[FlowAutoSwitch] Saved last run payload for auto-rerun");
+    }catch(e){}
+  }
   return false;
 });
 
 if(window.location.href.includes("labs.google")){
   setTimeout(function(){
     _flowStartCreditMonitor();
-    chrome.storage.local.get(FLOW_SWITCHER_KEY,function(data){
+    chrome.storage.local.get([FLOW_SWITCHER_KEY, 'flowAutoRunAfterLogin', 'flowLastRunPayload'],function(data){
       const st=data[FLOW_SWITCHER_KEY];
       if(st&&st.justSwitched&&st.pendingQueue){
         console.log("[FlowAutoSwitch] Detected post-switch page load, restoring queue...");
         chrome.storage.local.set({[FLOW_SWITCHER_KEY]:{...st,justSwitched:false}},function(){
           _flowRestoreQueue(st.pendingQueue);
+        });
+      } else if(data['flowAutoRunAfterLogin']){
+        console.log("[FlowAutoSwitch] Detected post-login (autoAccountPicker), checking for saved run...");
+        chrome.storage.local.remove('flowAutoRunAfterLogin', function(){
+          const lastRun = data['flowLastRunPayload'];
+          if(lastRun && lastRun.payloads && lastRun.payloads.length > 0){
+            console.log("[FlowAutoSwitch] Re-executing last run with", lastRun.payloads.length, "payloads...");
+            setTimeout(function(){
+              try{
+                chrome.runtime.sendMessage({type:"SET_ZOOM",zoomFactor:0.8}).catch(function(){});
+              }catch(e){}
+              const fakeMessage={
+                type:"AUTO_FILL_FLOW",
+                payloads:lastRun.payloads,
+                groupId:"auto-rerun-"+Date.now()+"-"+Math.random().toString(36).slice(2,6),
+                concurrentPrompts:lastRun.concurrentPrompts||1,
+                promptDelaySecondsMin:lastRun.promptDelaySecondsMin||0,
+                promptDelaySecondsMax:lastRun.promptDelaySecondsMax||0
+              };
+              ce(fakeMessage,function(resp){
+                console.log("[FlowAutoSwitch] Auto-rerun response:",resp);
+              });
+            },5000);
+          } else {
+            // No saved payload - just open the side panel so user can click Run
+            console.log("[FlowAutoSwitch] No saved run found. Opening side panel...");
+            try{
+              chrome.runtime.sendMessage({type:"OPEN_SIDE_PANEL"}).catch(function(){});
+            }catch(e){}
+          }
         });
       }
     });

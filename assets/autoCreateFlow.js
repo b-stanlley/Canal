@@ -2,13 +2,49 @@
     'use strict';
 
     const STORAGE_KEY = 'flowAutoCreateEnabled';
+    const SIGNIN_ATTEMPTS_KEY = 'flowAutoSignInAttempts';
+    const ACCOUNT_PICK_ATTEMPTS_KEY = 'flowAutoAccountPickAttempts';
 
-    // Labels used by the "Create with Google Flow" call-to-action, per locale.
-    const BUTTON_LABELS = [
-        'create with google flow',
-        'criar com o google flow',
-        'criar com google flow',
-        'crear con google flow'
+    // The sign-in page is reached again on every failed OAuth round trip, and each
+    // round trip reloads the page. Without a persisted counter the automation would
+    // bounce between labs.google and accounts.google.com forever.
+    const SIGNIN_MAX_ATTEMPTS = 3;
+    const SIGNIN_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
+
+    const TARGETS = [
+        {
+            name: 'createWithFlow',
+            appliesTo: () => location.pathname.includes('/tools/flow'),
+            labels: [
+                'create with google flow',
+                'criar com o google flow',
+                'criar com google flow',
+                'crear con google flow'
+            ]
+        },
+        {
+            name: 'signInWithGoogle',
+            appliesTo: () => location.pathname.includes('/api/auth/signin'),
+            labels: [
+                'sign in with google',
+                'fazer login com o google',
+                'entrar com o google',
+                'continuar com o google',
+                'iniciar sesión con google',
+                'different account',
+                'outra conta'
+            ],
+            limited: true
+        },
+        {
+            name: 'backToProjects',
+            appliesTo: () => location.pathname.includes('/tools/flow/project'),
+            labels: [
+                'voltar aos projetos',
+                'back to projects',
+                'volver a los proyectos'
+            ]
+        }
     ];
 
     const POLL_INTERVAL_MS = 1000;
@@ -19,9 +55,18 @@
     let lastClickAt = 0;
     let currentUrl = location.href;
     let pollTimer = null;
+    let isRunning = false;
 
-    function isFlowPage() {
-        return location.hostname === 'labs.google' && location.pathname.includes('/tools/flow');
+    function getStored(key) {
+        return new Promise((resolve) => {
+            chrome.storage.local.get(key, (data) => resolve(data[key]));
+        });
+    }
+
+    function setStored(key, value) {
+        return new Promise((resolve) => {
+            chrome.storage.local.set({ [key]: value }, resolve);
+        });
     }
 
     function normalize(text) {
@@ -35,19 +80,31 @@
         return style.visibility !== 'hidden' && style.display !== 'none' && style.pointerEvents !== 'none';
     }
 
-    function findCreateButton() {
-        const candidates = document.querySelectorAll('button, a, [role="button"]');
-        for (const el of candidates) {
-            if (clickedElements.has(el)) continue;
-            if (!BUTTON_LABELS.includes(normalize(el.textContent))) continue;
-            if (!isVisible(el)) continue;
-            return el;
-        }
-        return null;
+    function activeTarget() {
+        if (location.hostname !== 'labs.google') return null;
+        return TARGETS.find((target) => target.appliesTo()) || null;
     }
 
-    function clickElement(el) {
-        console.log('[FlowAutoCreate] Clicking "Create with Google Flow" button:', el);
+    function findButton(target) {
+        const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], div, span')).filter(el => {
+            if (clickedElements.has(el)) return false;
+            if (!isVisible(el)) return false;
+            const text = normalize(el.textContent);
+            return target.labels.some(label => text.includes(label));
+        });
+
+        if (candidates.length === 0) return null;
+
+        // Sort by text length to find the most deeply nested element
+        candidates.sort((a, b) => (a.textContent || "").length - (b.textContent || "").length);
+        
+        // Find the actual interactive button wrapping this element
+        const targetBtn = candidates[0];
+        return targetBtn.closest('button, a, [role="button"]') || targetBtn;
+    }
+
+    function clickElement(el, target) {
+        console.log('[FlowAutoCreate] Clicking "' + target.name + '" button:', el);
 
         try {
             const options = { view: window, bubbles: true, cancelable: true, buttons: 1 };
@@ -60,8 +117,29 @@
         }
     }
 
-    function run() {
-        if (!enabled || !isFlowPage()) return;
+    // Returns false when the sign-in retry budget is spent, so a broken login
+    // stops bouncing and leaves the page usable by hand.
+    async function consumeSignInAttempt() {
+        const now = Date.now();
+        const stored = await getStored(SIGNIN_ATTEMPTS_KEY);
+        const withinWindow = stored && now - stored.firstAt < SIGNIN_ATTEMPT_WINDOW_MS;
+        const state = withinWindow ? stored : { count: 0, firstAt: now };
+
+        if (state.count >= SIGNIN_MAX_ATTEMPTS) {
+            console.warn(
+                '[FlowAutoCreate] Sign-in retried ' + state.count + ' times without success. ' +
+                'Automation paused - sign in manually, or reset it with ' +
+                'chrome.storage.local.remove("' + SIGNIN_ATTEMPTS_KEY + '").'
+            );
+            return false;
+        }
+
+        await setStored(SIGNIN_ATTEMPTS_KEY, { count: state.count + 1, firstAt: state.firstAt });
+        return true;
+    }
+
+    async function run() {
+        if (!enabled || isRunning) return;
 
         if (location.href !== currentUrl) {
             // Single page app navigation: allow the button to be clicked again.
@@ -70,14 +148,32 @@
             lastClickAt = 0;
         }
 
+        const target = activeTarget();
+        if (!target) return;
+
+        // Reaching Flow itself means the login worked, so the retry budgets are fresh.
+        if (target.name === 'createWithFlow') {
+            chrome.storage.local.remove([SIGNIN_ATTEMPTS_KEY, ACCOUNT_PICK_ATTEMPTS_KEY]);
+        }
+
         if (Date.now() - lastClickAt < RECLICK_COOLDOWN_MS) return;
 
-        const button = findCreateButton();
+        const button = findButton(target);
         if (!button) return;
 
-        clickedElements.add(button);
-        lastClickAt = Date.now();
-        clickElement(button);
+        isRunning = true;
+        try {
+            if (target.limited && !(await consumeSignInAttempt())) {
+                clickedElements.add(button);
+                return;
+            }
+
+            clickedElements.add(button);
+            lastClickAt = Date.now();
+            clickElement(button, target);
+        } finally {
+            isRunning = false;
+        }
     }
 
     function start() {
