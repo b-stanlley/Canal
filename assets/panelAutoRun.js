@@ -18,6 +18,10 @@
   /* rotulos do botao em todos os idiomas do painel */
   const RUN_LABELS = /^(run|executar|ejecutar|exécuter|démarrer|lancer|starten|ausführen|avvia|esegui|jalankan|patakbuhin|uitvoeren|çalıştır|chạy|실행|実行|运行|เริ่ม|रन|चलाएं|تشغيل|запустить)$/i;
 
+  const PROGRESS_KEY = "flowAutoRunProgress";
+  const PROGRESS_MAX_AGE_MS = 12 * 60 * 60 * 1000;   // progresso mais velho que isso e ignorado
+
+  let progress = null;           // {lastDone, total, updatedAt} - ultima cena gerada E baixada
   let epochStartedAt = 0;        // quando a tela atual "chegou"
   let clickedInEpoch = false;    // no maximo um clique automatico por chegada
   let lastQueueActivityAt = 0;   // ultimo PROMPT_GROUP_STATUS ativo
@@ -49,6 +53,62 @@
     return null;
   }
 
+  /* Os dois campos numericos (Start / End) ficam no popover que aparece no
+     hover do Run. Estao sempre no DOM (v-show), entao da para ajusta-los mesmo
+     com o popover fechado. Em ordem de documento: primeiro Start, depois End. */
+  function findRangeInputs(runBtn) {
+    let node = runBtn;
+    for (let up = 0; up < 4 && node; up++) {
+      const inputs = node.querySelectorAll ? node.querySelectorAll('input[type="number"]') : [];
+      if (inputs.length === 2) return { start: inputs[0], end: inputs[1] };
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  /* v-model do Vue escuta o evento "input", entao nao basta setar .value */
+  function setInputValue(el, value) {
+    const proto = Object.getPrototypeOf(el);
+    const desc = Object.getOwnPropertyDescriptor(proto, "value");
+    if (desc && desc.set) desc.set.call(el, String(value));
+    else el.value = String(value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  /* Posiciona o Start na cena seguinte a ultima que foi gerada E baixada.
+     Devolve false quando nao ha mais nada a executar. */
+  function applyResumePoint(runBtn) {
+    if (!progress || !(progress.lastDone > 0)) return true;
+    if (Date.now() - (progress.updatedAt || 0) > PROGRESS_MAX_AGE_MS) {
+      console.log(TAG, "Saved progress is too old, running the panel range as is");
+      return true;
+    }
+
+    const range = findRangeInputs(runBtn);
+    if (!range) {
+      console.warn(TAG, "Start/End fields not found - running the panel range as is");
+      return true;
+    }
+
+    const total = Number(range.end.getAttribute("max")) || 0;
+    if (progress.total && total && progress.total !== total) {
+      console.log(TAG, "Prompt list changed (" + progress.total + " -> " + total + "), ignoring saved progress");
+      return true;
+    }
+
+    const resumeAt = progress.lastDone + 1;
+    if (total && resumeAt > total) {
+      console.log(TAG, "Scene " + progress.lastDone + " was the last one - nothing left to run");
+      return false;
+    }
+    if (Number(range.start.value) === resumeAt) return true;
+
+    console.log(TAG, "Resuming at scene " + resumeAt + " (scene " + progress.lastDone + " was generated and downloaded)");
+    setInputValue(range.start, resumeAt);
+    return true;
+  }
+
   function clickRun() {
     if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
 
@@ -66,6 +126,8 @@
       }
       return;
     }
+
+    if (!applyResumePoint(btn)) return;
 
     lastClickAt = Date.now();
     clickedInEpoch = true;
@@ -108,12 +170,65 @@
     }, wait);
   }
 
+  function readTotalPrompts() {
+    const btn = findRunButton();
+    if (!btn) return 0;
+    const range = findRangeInputs(btn);
+    return range ? Number(range.end.getAttribute("max")) || 0 : 0;
+  }
+
+  /* Guarda a maior cena que foi gerada E baixada. E dela que a proxima conta
+     retoma. Um grupo novo comecando na cena 1 significa que o usuario
+     recomecou do zero, entao o progresso anterior e descartado. */
+  function recordProgress(data) {
+    const results = data && data.results;
+    if (!Array.isArray(results) || results.length === 0) return;
+
+    const indices = Array.isArray(data.promptIndices) ? data.promptIndices.filter(function (n) { return typeof n === "number"; }) : [];
+    const firstOfGroup = indices.length ? Math.min.apply(null, indices) : 0;
+    if (progress && firstOfGroup === 1 && progress.lastDone > 1 && progress.groupId !== data.id) {
+      console.log(TAG, "New run starting from scene 1 - discarding saved progress");
+      progress = null;
+      chrome.storage.local.remove(PROGRESS_KEY);
+    }
+
+    let maxDone = 0;
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r && r.success && r.downloadComplete && typeof r.promptIndex === "number" && r.promptIndex > maxDone) {
+        maxDone = r.promptIndex;
+      }
+    }
+    if (maxDone <= 0) return;
+    if (progress && progress.lastDone >= maxDone) return;
+
+    progress = {
+      lastDone: maxDone,
+      total: readTotalPrompts() || (progress && progress.total) || 0,
+      groupId: data.id,
+      updatedAt: Date.now()
+    };
+    try { chrome.storage.local.set({ [PROGRESS_KEY]: progress }); } catch (e) {}
+    console.log(TAG, "Scene " + maxDone + " generated and downloaded - next account resumes at " + (maxDone + 1));
+  }
+
+  try {
+    chrome.storage.local.get(PROGRESS_KEY, function (data) {
+      const saved = data && data[PROGRESS_KEY];
+      if (saved && saved.lastDone > 0) {
+        progress = saved;
+        console.log(TAG, "Saved progress: last finished scene is " + saved.lastDone);
+      }
+    });
+  } catch (e) {}
+
   chrome.runtime.onMessage.addListener(function (msg) {
     if (!msg || !msg.type) return;
 
     if (msg.type === "PROMPT_GROUP_STATUS") {
       const d = msg.data || {};
       if (d.status === "running" || d.status === "queued") lastQueueActivityAt = Date.now();
+      recordProgress(d);
       /* progresso de verdade: algum prompt foi processado */
       if (d.processedCount > 0 && clicksWithoutProgress > 0) {
         console.log(TAG, "Queue is making progress, auto-run counter reset");
