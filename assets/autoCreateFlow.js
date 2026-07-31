@@ -154,6 +154,7 @@
         // Reaching Flow itself means the login worked, so the retry budgets are fresh.
         if (target.name === 'createWithFlow') {
             chrome.storage.local.remove([SIGNIN_ATTEMPTS_KEY, ACCOUNT_PICK_ATTEMPTS_KEY]);
+            console.log('[FlowAutoCreate] Reached Flow page! Sign-in retry budgets reset.');
         }
 
         if (Date.now() - lastClickAt < RECLICK_COOLDOWN_MS) return;

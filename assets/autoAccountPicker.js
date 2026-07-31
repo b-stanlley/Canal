@@ -12,7 +12,7 @@
   const ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
 
   const POLL_INTERVAL_MS = 1000;
-  const RECLICK_COOLDOWN_MS = 3000;
+  const RECLICK_COOLDOWN_MS = 10000;
   const EMAIL_PATTERN = /[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}/;
 
   let enabled = true;
@@ -82,24 +82,7 @@
     }
   }
 
-  async function consumeAttempt() {
-    const now = Date.now();
-    const stored = await getStored(ATTEMPTS_KEY);
-    const withinWindow = stored && now - stored.firstAt < ATTEMPT_WINDOW_MS;
-    const state = withinWindow ? stored : { count: 0, firstAt: now };
-
-    if (state.count >= MAX_ATTEMPTS) {
-      console.warn(
-        '[FlowAutoPick] Account picked ' + state.count + ' times without reaching Flow. ' +
-        'Automation paused - pick an account manually, or reset it with ' +
-        'chrome.storage.local.remove("' + ATTEMPTS_KEY + '").'
-      );
-      return false;
-    }
-
-    await setStored(ATTEMPTS_KEY, { count: state.count + 1, firstAt: state.firstAt });
-    return true;
-  }
+  const ACCOUNT_INDEX_KEY = 'flowAutoPickCurrentIndex';
 
   async function run() {
     if (!enabled || isRunning || !isChooserPage()) return;
@@ -117,35 +100,36 @@
     const switcher = await getStored(SWITCHER_KEY);
     if (switcher && switcher.switching) return;
 
-    const rows = findAccountRows().filter((row) => !clickedElements.has(row.element));
+    const rows = findAccountRows();
     if (rows.length === 0) return;
 
-    const preferred = await getStored(ACCOUNT_KEY);
-    let chosen = rows[0];
+    // Get the current account index to try
+    const storedIndex = (await getStored(ACCOUNT_INDEX_KEY)) || 0;
+    const accountIndex = storedIndex % rows.length;
 
-    if (preferred) {
-      const match = rows.find((row) => row.email === String(preferred).toLowerCase());
-      if (!match) {
-        console.warn('[FlowAutoPick] Preferred account ' + preferred + ' is not on this screen.');
-        return;
-      }
-      chosen = match;
+    // If we've cycled through ALL accounts, stop
+    if (storedIndex >= rows.length) {
+      console.warn(
+        '[FlowAutoPick] Tried all ' + rows.length + ' accounts without success. ' +
+        'Automation paused. Reset with: chrome.storage.local.remove("' + ACCOUNT_INDEX_KEY + '")'
+      );
+      return;
     }
+
+    const chosen = rows[accountIndex];
 
     isRunning = true;
     try {
-      if (!(await consumeAttempt())) {
-        clickedElements.add(chosen.element);
-        return;
-      }
+      // Advance the index for next time (in case this account fails)
+      await setStored(ACCOUNT_INDEX_KEY, storedIndex + 1);
 
       clickedElements.add(chosen.element);
       lastClickAt = Date.now();
-      console.log('[FlowAutoPick] Choosing account:', chosen.email);
-      
+      console.log('[FlowAutoPick] Choosing account ' + (accountIndex + 1) + '/' + rows.length + ': ' + chosen.email);
+
       // Signal the content script on Flow to auto-click "Run" after login
       await setStored('flowAutoRunAfterLogin', true);
-      
+
       clickElement(chosen.element);
     } finally {
       isRunning = false;
